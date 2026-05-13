@@ -28,11 +28,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
       - name: Install kustomize
-        run: go install sigs.k8s.io/kustomize/kustomize/v5@latest
+        run: |
+          KUSTOMIZE_VERSION=$(curl -sL https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['tag_name'])")
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" | tar xz
+          chmod +x kustomize
+          ./kustomize version
       - name: Validate all overlays
         run: |
           kustomize build environments/dev
