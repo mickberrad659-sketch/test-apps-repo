@@ -31,13 +31,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - run: go install sigs.k8s.io/kustomize/kustomize/v5@latest
-      - name: Validate dev
-        run: kustomize build environments/dev
-      - name: Validate staging
-        run: kustomize build environments/staging
-      - name: Validate prod
-        run: kustomize build environments/prod
+      - name: Install kustomize
+        run: go install sigs.k8s.io/kustomize/kustomize/v5@latest
+      - name: Validate all overlays
+        run: |
+          kustomize build environments/dev
+          kustomize build environments/staging
+          kustomize build environments/prod
 
   build-push:
     name: Build & Push
@@ -54,13 +54,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Docker buildx with OIDC-based GHCR auth (no secrets needed)
-      - uses: docker/login-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           oidc-provider: azure
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Extract metadata
         id: meta
@@ -98,44 +99,44 @@ jobs:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: |
-            environments/${{ github.event.inputs.environment || 'dev' }}
+            environments
           sparse-checkout-cone-mode: false
 
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Configure kubectl
+      - name: Get kubeconfig
         run: |
           mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no -i /home/al/clone/t3s-argo/secrets/control-plane-ssh-key \
-              root@2.26.98.178 "cat /etc/rancher/k3s/k3s.yaml" | \
+          ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -i /home/al/clone/t3s-argo/secrets/control-plane-ssh-key \
+              root@2.26.98.178 \
+              "cat /etc/rancher/k3s/k3s.yaml" | \
               sed 's|127.0.0.1|2.26.98.178|g' > ~/.kube/config
           chmod 600 ~/.kube/config
+        env:
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+
+      - name: Setup kubectl
+        run: |
+          mkdir -p /usr/local/bin
+          curl -sLo /usr/local/bin/kubectl https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
 
       - name: Build and apply manifest
         env:
           IMAGE_TAG: ${{ needs.build-push.outputs.sha }}
           ENV: ${{ github.event.inputs.environment || 'dev' }}
         run: |
-          mkdir -p /tmp/kustomize-out
-          cat > /tmp/kustomize-out/image.yaml << EOF
-          apiVersion: kustomize.config.k8s.io/v1beta1
-          kind: Kustomization
-          images:
-            - name: nginx
-              newName: ghcr.io/\${{ github.repository_owner }}/test-apps-repo
-              newTag: \$IMAGE_TAG
-          EOF
           cd environments/$ENV
-          kustomize build . --load-restrictor=LoadRestrictionsNone > /tmp/kustomize-out/manifest.yaml
-          kubectl apply --server-side -f /tmp/kustomize-out/manifest.yaml
-          echo "Deployed with image tag: $IMAGE_TAG to env: $ENV"
+          kustomize build . --load-restrictor=LoadRestrictionsNone | \
+            sed 's|nginx:alpine|ghcr.io/${{ github.repository_owner }}/test-apps-repo:'"$IMAGE_TAG"'|g' | \
+            kubectl apply --server-side -f -
+          echo "Deployed image: ghcr.io/${{ github.repository_owner }}/test-apps-repo:$IMAGE_TAG"
 
       - name: Verify deployment
         env:
-          ENV: ${{ github.event.inputs.environment || 'dev' }}
           SUFFIX: ${{ github.event.inputs.environment || 'dev' }}
         run: |
-          DEPLOY_NAME="test-app-${SUFFIX}"
-          kubectl rollout status deployment/$DEPLOY_NAME --timeout=60s || true
-          kubectl get deployment,pods -l app.kubernetes.io/managed-by=argocd 2>/dev/null || kubectl get pods
+          DEPLOY="test-app-${SUFFIX}"
+          kubectl get deployment "$DEPLOY" -o wide
+          kubectl get pods -l app=test-app 2>/dev/null || kubectl get pods
