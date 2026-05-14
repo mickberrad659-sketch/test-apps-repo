@@ -1,18 +1,10 @@
-name: CI/CD Pipeline
+name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Environment to deploy'
-        required: true
-        default: 'dev'
-        type: choice
-        options: [dev, staging, prod]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,6 +15,7 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/test-apps-repo
 
 jobs:
+  # Step 1: validate kustomize overlays
   validate:
     name: Validate Kustomize
     runs-on: ubuntu-24.04
@@ -34,23 +27,23 @@ jobs:
           curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/${TAG}/kustomize_${TAG#kustomize\/}_linux_amd64.tar.gz" -o kustomize.tar.gz
           tar xzf kustomize.tar.gz
           chmod +x kustomize
-          ./kustomize version
       - name: Validate all overlays
         run: |
-          kustomize build environments/dev
-          kustomize build environments/staging
-          kustomize build environments/prod
+          ./kustomize build environments/dev
+          ./kustomize build environments/staging
+          ./kustomize build environments/prod
 
-  build-push:
-    name: Build & Push
+  # Step 2: build + push image
+  build:
+    name: Build & Push Image
     needs: validate
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
       packages: write
-      id-token: write
     outputs:
-      sha: ${{ steps.sha.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      bumped: ${{ steps.version.outputs.bumped }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -75,10 +68,6 @@ jobs:
             type=sha,prefix=,format=short
             type=ref,event=branch
 
-      - name: Record short SHA
-        id: sha
-        run: echo "sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -90,54 +79,78 @@ jobs:
           provenance: false
           sbom: false
 
-  deploy:
-    name: Deploy to k3s
-    needs: build-push
-    runs-on: ubuntu-24.04
-    if: ${{ false }}  # Disabled: requires SSH_KEY secret (add via repo Settings → Secrets)
-    environment: ${{ github.event.inputs.environment || 'dev' }}
-    concurrency:
-      group: deploy-${{ github.ref }}
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            environments
-          sparse-checkout-cone-mode: false
-
-      - name: Install kubectl
+      - name: Determine semver bump
+        id: version
         run: |
-          mkdir -p /usr/local/bin
-          curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
+          set -euo pipefail
 
-      - name: Get kubeconfig
-        run: |
-          echo "$SSH_KEY" > /tmp/ssh_key
-          chmod 600 /tmp/ssh_key
-          mkdir -p ~/.kube
-          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i /tmp/ssh_key \
-              root@2.26.98.178 \
-              "cat /etc/rancher/k3s/k3s.yaml" | \
-              sed 's|127.0.0.1|2.26.98.178|g' > ~/.kube/config
-          chmod 600 ~/.kube/config
-          rm /tmp/ssh_key
-        env:
-          SSH_KEY: ${{ secrets.SSH_KEY }}
+          HEAD_MSG=$(git log -1 --format=%B)
+          echo "HEAD_MSG=$HEAD_MSG"
+          echo "head_msg=$HEAD_MSG" >> $GITHUB_OUTPUT
 
-      - name: Build and apply manifest
-        env:
-          IMAGE_TAG: ${{ needs.build-push.outputs.sha }}
-          ENV: ${{ github.event.inputs.environment || 'dev' }}
-        run: |
-          cd environments/$ENV
-          kustomize build . --load-restrictor=LoadRestrictionsNone | \
-            sed 's|nginx:alpine|ghcr.io/${{ github.repository_owner }}/test-apps-repo:'"$IMAGE_TAG"'|g' | \
-            kubectl apply --server-side -f -
-          echo "Deployed: ghcr.io/${{ github.repository_owner }}/test-apps-repo:$IMAGE_TAG"
+          # Skip CI marker = this commit was made by CI itself
+          if echo "$HEAD_MSG" | grep -qiE '\[skip ci\]|skip-checks'; then
+            echo "🔁 Skip-CI commit detected, skipping version bump"
+            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "bumped=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-      - name: Verify deployment
-        run: |
-          kubectl rollout status deployment/test-app-${ENV} --timeout=60s || true
-          kubectl get pods -l app=test-app
+          # Read current version (or default)
+          if [ -f VERSION ]; then
+            CURRENT=$(cat VERSION)
+          else
+            CURRENT="0.0.0"
+          fi
+          echo "Current version: $CURRENT"
+
+          # Parse conventional commit for semver bump type
+          COMMIT_MSG=$(echo "$HEAD_MSG" | head -1 | tr '[:upper:]' '[:lower:]')
+
+          # BREAKING CHANGE in body = major
+          if echo "$HEAD_MSG" | grep -qiE 'BREAKING CHANGE:|!:$'; then
+            BUMP="major"
+          elif echo "$COMMIT_MSG" | grep -q '^feat:'; then
+            BUMP="minor"
+          elif echo "$COMMIT_MSG" | grep -qE '^(fix|chore|docs|style|refactor|test):'; then
+            BUMP="patch"
+          else
+            BUMP="none"
+          fi
+          echo "Bump type: $BUMP"
+
+          if [ "$BUMP" = "none" ]; then
+            echo "No semver bump needed (not a conventional commit)"
+            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
+            echo "bumped=false" >> $GITHUB_OUTPUT
+          else
+            NEW_VERSION=$(python3 -c "
+from packaging import version
+v = version.parse('$CURRENT')
+if '$BUMP' == 'major':
+    v = version.parse(f'{v.major+1}.0.0')
+elif '$BUMP' == 'minor':
+    v = version.parse(f'{v.major}.{v.minor+1}.0')
+else:
+    v = version.parse(f'{v.major}.{v.minor}.{v.micro+1}')
+print(v)
+" 2>/dev/null || python3 -c "
+import re
+v = '$CURRENT'
+parts = [int(x) for x in v.split('.')] + [0,0,0]
+if '$BUMP' == 'major':
+    parts[0] += 1; parts[1] = 0; parts[2] = 0
+elif '$BUMP' == 'minor':
+    parts[1] += 1; parts[2] = 0
+else:
+    parts[2] += 1
+print(f'{parts[0]}.{parts[1]}.{parts[2]}')
+")
+            echo "Bumped version: $NEW_VERSION"
+            echo "$NEW_VERSION" > VERSION
+            git add VERSION
+            git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
+            git push origin main
+            echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+            echo "bumped=true" >> $GITHUB_OUTPUT
+          fi
