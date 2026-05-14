@@ -15,7 +15,6 @@ env:
   IMAGE_NAME: ${{ github.repository_owner }}/test-apps-repo
 
 jobs:
-  # Step 1: validate kustomize overlays
   validate:
     name: Validate Kustomize
     runs-on: ubuntu-24.04
@@ -23,42 +22,38 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install kustomize
         run: |
-          TAG=$(curl -sL "https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest" | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
+          set -e
+          TAG=$(curl -sL "https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest" | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
           curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/${TAG}/kustomize_${TAG#kustomize\/}_linux_amd64.tar.gz" -o kustomize.tar.gz
           tar xzf kustomize.tar.gz
           chmod +x kustomize
+          ./kustomize version
       - name: Validate all overlays
         run: |
+          set -e
           ./kustomize build environments/dev
           ./kustomize build environments/staging
           ./kustomize build environments/prod
 
-  # Step 2: build + push image
   build:
-    name: Build & Push Image
+    name: Build & Push
     needs: validate
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       packages: write
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      bumped: ${{ steps.version.outputs.bumped }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -67,7 +62,6 @@ jobs:
           tags: |
             type=sha,prefix=,format=short
             type=ref,event=branch
-
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -78,79 +72,3 @@ jobs:
           cache-to: type=gha,mode=max,scope=main
           provenance: false
           sbom: false
-
-      - name: Determine semver bump
-        id: version
-        run: |
-          set -euo pipefail
-
-          HEAD_MSG=$(git log -1 --format=%B)
-          echo "HEAD_MSG=$HEAD_MSG"
-          echo "head_msg=$HEAD_MSG" >> $GITHUB_OUTPUT
-
-          # Skip CI marker = this commit was made by CI itself
-          if echo "$HEAD_MSG" | grep -qiE '\[skip ci\]|skip-checks'; then
-            echo "🔁 Skip-CI commit detected, skipping version bump"
-            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
-            echo "bumped=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Read current version (or default)
-          if [ -f VERSION ]; then
-            CURRENT=$(cat VERSION)
-          else
-            CURRENT="0.0.0"
-          fi
-          echo "Current version: $CURRENT"
-
-          # Parse conventional commit for semver bump type
-          COMMIT_MSG=$(echo "$HEAD_MSG" | head -1 | tr '[:upper:]' '[:lower:]')
-
-          # BREAKING CHANGE in body = major
-          if echo "$HEAD_MSG" | grep -qiE 'BREAKING CHANGE:|!:$'; then
-            BUMP="major"
-          elif echo "$COMMIT_MSG" | grep -q '^feat:'; then
-            BUMP="minor"
-          elif echo "$COMMIT_MSG" | grep -qE '^(fix|chore|docs|style|refactor|test):'; then
-            BUMP="patch"
-          else
-            BUMP="none"
-          fi
-          echo "Bump type: $BUMP"
-
-          if [ "$BUMP" = "none" ]; then
-            echo "No semver bump needed (not a conventional commit)"
-            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
-            echo "bumped=false" >> $GITHUB_OUTPUT
-          else
-            NEW_VERSION=$(python3 -c "
-from packaging import version
-v = version.parse('$CURRENT')
-if '$BUMP' == 'major':
-    v = version.parse(f'{v.major+1}.0.0')
-elif '$BUMP' == 'minor':
-    v = version.parse(f'{v.major}.{v.minor+1}.0')
-else:
-    v = version.parse(f'{v.major}.{v.minor}.{v.micro+1}')
-print(v)
-" 2>/dev/null || python3 -c "
-import re
-v = '$CURRENT'
-parts = [int(x) for x in v.split('.')] + [0,0,0]
-if '$BUMP' == 'major':
-    parts[0] += 1; parts[1] = 0; parts[2] = 0
-elif '$BUMP' == 'minor':
-    parts[1] += 1; parts[2] = 0
-else:
-    parts[2] += 1
-print(f'{parts[0]}.{parts[1]}.{parts[2]}')
-")
-            echo "Bumped version: $NEW_VERSION"
-            echo "$NEW_VERSION" > VERSION
-            git add VERSION
-            git commit -m "chore: bump version to $NEW_VERSION [skip ci]"
-            git push origin main
-            echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
-            echo "bumped=true" >> $GITHUB_OUTPUT
-          fi
