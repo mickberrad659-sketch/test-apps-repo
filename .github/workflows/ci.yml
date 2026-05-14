@@ -72,3 +72,32 @@ jobs:
           cache-to: type=gha,mode=max,scope=main
           provenance: false
           sbom: false
+
+      - name: Commit image tag to Git
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -e
+          # Get the short SHA tag just pushed
+          IMAGE_TAG="${GITHUB_SHA::8}"
+          REGISTRY="${{ env.REGISTRY }}"
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ env.IMAGE_NAME }}"
+          FULL_IMAGE="${REGISTRY}/${OWNER}/${REPO#*/}:${IMAGE_TAG}"
+
+          echo "Committing image tag ${FULL_IMAGE} to environments/base/deployment.yaml"
+
+          # Update image in base deployment
+          sed -i "s|image:.*|image: ${FULL_IMAGE}|" environments/base/deployment.yaml
+          cat environments/base/deployment.yaml
+
+          # Commit if changed (skip if CI commit itself)
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add environments/base/deployment.yaml
+            git commit -m "ci: update image to ${IMAGE_TAG}"
+            git push origin main
+            echo "Image tag committed: ${IMAGE_TAG}"
+          else
+            echo "No changes to commit (likely CI self-commit)"
+          fi
