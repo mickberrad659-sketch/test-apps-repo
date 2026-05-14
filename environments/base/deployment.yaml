@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: nginx
-        image: ghcr.io/mickberrad659-sketch/test-apps-repo:6d328d49
+        image: ghcr.io/mickberrad659-sketch/test-apps-repo:6d328d4
         ports:
         - containerPort: 80
         resources:
